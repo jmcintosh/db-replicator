@@ -4,48 +4,80 @@ use DBI;
 use strict;
 use warnings;
 
-###### read config file ######
+# read config file
 my %config;
 Config::Simple->import_from('replicator.ini', \%config);
 
-###### connect to local slave database #######
-my $slave_data_source = 
+# connect to local slave database
+my $slave_db = connectToDatabase(
     "DBI:Pg:dbname=".$config{"slave.dbname"}.
     ";host=".$config{"slave.host"}.
-    ";port=".$config{"slave.port"};
-
-my $slave_db = DBI->connect(
-    $slave_data_source,
+    ";port=".$config{"slave.port"},
     $config{"slave.user"},
     $config{"slave.password"}
-) or die "Connection Error: $DBI::errstr\n";
-$slave_db->{AutoCommit} = 0;
-$slave_db->{RaiseError} = 1;
+);
 #print a line if DB connection is established.
-my $ping=$slave_db->ping;
+my $ping = $slave_db->ping;
 print "slave db ping = $ping\n";
 
-###### connect to master database #######
-my $master_data_source = 
+# connect to master database
+my $master_db = connectToDatabase(
     "DBI:Pg:dbname=".$config{"master.dbname"}.
     ";host=".$config{"master.host"}.
-    ";port=".$config{"master.port"};
-my $master_db = DBI->connect(
-    $master_data_source,
+    ";port=".$config{"master.port"},
     $config{"master.user"},
     $config{"master.password"}
-) or die "Connection Error: $DBI::errstr\n";
-$master_db->{AutoCommit} = 0;
-$master_db->{RaiseError} = 1;
+);
 #print a line if DB connection is established.
-$ping=$master_db->ping;
+$ping = $master_db->ping;
 print "master db ping = $ping\n";
+my $master_schema = $config{"master.schema"};
 
-my %slave_table_updates;
-my %master_table_updates;
+my $initialized = $config{"slave.initialized"};
+if(!(defined $initialized)){
+    $initialized = 0;
+}
+if($initialized != 1){
+    # create master_table_update table
+    print "initialize slave db";
+    $slave_db->do(
+        "CREATE TABLE IF NOT EXISTS $master_schema.master_table_update
+        (
+            master_table character varying(48) NOT NULL,
+            updated_at timestamp with time zone,
+            CONSTRAINT table_update_pkey PRIMARY KEY (master_table)
+        )"
+    ) or die $slave_db->errstr;
+
+    # populate table
+    my $query = $master_db->prepare(
+        "SELECT master_table FROM $master_schema.master_table_update"
+    );
+    $query->execute() or die $slave_db->errstr;
+    my @row = $query->fetchrow_array();
+    if(!@row){
+        die "no tables found in master DB\n";
+    }
+    my $insert = $slave_db->prepare(
+        "INSERT INTO $master_schema.master_table_update
+        (master_table) VALUES (?)"
+    );
+    while(@row){
+        my $table = $row[0];
+        $insert->execute($table);
+        @row = $query->fetchrow_array();
+    }
+
+    $slave_db->commit();
+    my $ini = new Config::Simple('replicator.ini') or die Config::Simple->error();
+    $ini->param("slave.initialized","1");
+    $ini->save();
+}
 
 
-my $query = $slave_db->prepare("SELECT * FROM master_table_update");
+my $query = $slave_db->prepare(
+    "SELECT * FROM $master_schema.master_table_update"
+);
 $query->execute();
 my @row = $query->fetchrow_array();
 if(!@row){
@@ -54,10 +86,13 @@ if(!@row){
 while(@row){
     my $table = $row[0];
     my $slave_timestamp = $row[1];
+    if(!(defined $slave_timestamp)) {
+        $slave_timestamp = "";
+    }
     
     my $query_is_updated = $master_db->prepare(
         "SELECT updated_at 
-        FROM master_table_update 
+        FROM $master_schema.master_table_update 
         WHERE master_table = ? LIMIT 1"
     );
 
@@ -65,6 +100,9 @@ while(@row){
     my @response = $query_is_updated->fetchrow_array();
     if(@response){
         my $master_timestamp = $response[0];
+        if(!(defined $master_timestamp)) {
+            $master_timestamp = "";
+        }
         if($slave_timestamp ne $master_timestamp){
             print "timestamps are not the same, update table $table\n";
             # update the event table
@@ -72,7 +110,7 @@ while(@row){
             
             # update the slave update table
             my $query_update = $slave_db->prepare(
-                "UPDATE master_table_update 
+                "UPDATE $master_schema.master_table_update 
                 SET updated_at = ? 
                 WHERE master_table = ?"
             );
@@ -87,11 +125,9 @@ while(@row){
     }else{
         print "record for table $table not found in master DB\n";
     }
-    $query_is_updated->finish();
     
     @row = $query->fetchrow_array();
 }
-$query->finish;
 
 # disconnect from databases
 $master_db->disconnect();
@@ -101,9 +137,7 @@ print "disconnected from databases, done.\n";
 sub updateTable{
     my $table = $_[0];
     # clear data from the slave table
-    my $query_clear_table = $slave_db->prepare("TRUNCATE $table;");
-    $query_clear_table->execute();
-    $query_clear_table->finish();
+    my $query_clear_table = $slave_db->do("TRUNCATE $table;");
     
     # get data from the master db
     my $query_get_data = $master_db->prepare("SELECT * FROM $table;");
@@ -122,7 +156,19 @@ sub updateTable{
         
         @values = $query_get_data->fetchrow_array;
     }
-    $query_put_data->finish();
-    $query_get_data->finish();
-    
+}
+
+sub connectToDatabase{
+    my $data_source = $_[0];
+    my $user = $_[1];
+    my $password = $_[2];
+
+    my $dbh = DBI->connect(
+        $data_source,
+        $user,
+        $password
+    ) or die "Connection Error: $DBI::errstr\n";
+    $dbh->{AutoCommit} = 0;
+    $dbh->{RaiseError} = 1;
+    return $dbh;
 }
